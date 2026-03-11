@@ -208,6 +208,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let lastErrorMessage = '';
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -233,6 +234,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (result.status === 'error') {
       hadError = true;
+      if (result.error) lastErrorMessage = result.error;
     }
   });
 
@@ -249,6 +251,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
+
+    // Notify user about the error
+    const errLower = lastErrorMessage.toLowerCase();
+    const isRateLimit =
+      errLower.includes('rate limit') ||
+      errLower.includes('capacity') ||
+      errLower.includes('usage limit') ||
+      errLower.includes('too many requests') ||
+      errLower.includes('429') ||
+      errLower.includes('overloaded');
+    const userMsg = isRateLimit
+      ? '⚠️ Hit Claude usage limit. Will retry when it resets (usually within a few hours).'
+      : `⚠️ Agent error — will retry on your next message.${lastErrorMessage ? ` (${lastErrorMessage.slice(0, 120)})` : ''}`;
+    try {
+      await channel.sendMessage(chatJid, userMsg);
+    } catch (notifyErr) {
+      logger.warn({ notifyErr }, 'Failed to send error notification');
+    }
+
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
