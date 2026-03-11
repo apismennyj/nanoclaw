@@ -32,3 +32,7 @@ nohup "/usr/bin/node" "/home/pav/ai-agents/nanoclaw/dist/index.js" \
 echo $! > "/home/pav/ai-agents/nanoclaw/nanoclaw.pid"
 echo "NanoClaw started (PID $!)"
 echo "Logs: tail -f /home/pav/ai-agents/nanoclaw/logs/nanoclaw.log"
+
+# Run startup notification script
+#sleep 2
+#python3 "/home/pav/ai-agents/nanoclaw/groups/telegram_main/startup_notify.py" 2>/dev/null &

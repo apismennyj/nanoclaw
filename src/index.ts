@@ -55,6 +55,7 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { formatHealthMessage, getSystemHealth } from './system-health.js';
 import {
   Channel,
   ImageAttachment,
@@ -630,6 +631,24 @@ async function main(): Promise<void> {
 
   if (TELEGRAM_BOT_POOL.length > 0) {
     await initBotPool(TELEGRAM_BOT_POOL);
+  }
+
+  // Send startup health status to main group
+  const mainGroupJid = Object.entries(registeredGroups).find(
+    ([, group]) => group.isMain === true,
+  )?.[0];
+  if (mainGroupJid) {
+    const mainChannel = findChannel(channels, mainGroupJid);
+    if (mainChannel) {
+      try {
+        const health = getSystemHealth(TIMEZONE);
+        const healthMessage = formatHealthMessage(health, ASSISTANT_NAME);
+        await mainChannel.sendMessage(mainGroupJid, healthMessage);
+        logger.info('Sent startup health status to main group');
+      } catch (err) {
+        logger.warn({ err }, 'Failed to send startup health status');
+      }
+    }
   }
 
   // Start subsystems (independently of connection handler)

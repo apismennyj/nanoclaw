@@ -191,8 +191,17 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  // Always sync core agent-runner files (index.ts, ipc-mcp-stdio.ts) from the
+  // canonical source so upstream updates (e.g. image support) reach existing groups.
+  // Agents can still add their own files in this directory — they won't be removed.
+  if (fs.existsSync(agentRunnerSrc)) {
+    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
+    for (const file of fs.readdirSync(agentRunnerSrc)) {
+      fs.copyFileSync(
+        path.join(agentRunnerSrc, file),
+        path.join(groupAgentRunnerDir, file),
+      );
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,

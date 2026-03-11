@@ -11,7 +11,12 @@ function fetchUrl(url: string): Promise<Buffer> {
     const client = url.startsWith('https') ? https : http;
     client
       .get(url, (res) => {
-        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        if (
+          res.statusCode &&
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location
+        ) {
           fetchUrl(res.headers.location).then(resolve).catch(reject);
           return;
         }
@@ -54,19 +59,28 @@ export async function downloadTelegramPhoto(
     const base64 = imageBuffer.toString('base64');
 
     if (base64.length > MAX_BASE64_BYTES) {
-      logger.warn({ fileId, bytes: base64.length }, 'Telegram photo too large, skipping');
+      logger.warn(
+        { fileId, bytes: base64.length },
+        'Telegram photo too large, skipping',
+      );
       return null;
     }
 
     // Detect media type from file extension
     const ext = filePath.split('.').pop()?.toLowerCase();
     const mediaType: ImageAttachment['mediaType'] =
-      ext === 'png' ? 'image/png'
-      : ext === 'webp' ? 'image/webp'
-      : ext === 'gif' ? 'image/gif'
-      : 'image/jpeg';
+      ext === 'png'
+        ? 'image/png'
+        : ext === 'webp'
+          ? 'image/webp'
+          : ext === 'gif'
+            ? 'image/gif'
+            : 'image/jpeg';
 
-    logger.info({ fileId, bytes: imageBuffer.length, mediaType }, 'Telegram photo downloaded');
+    logger.info(
+      { fileId, bytes: imageBuffer.length, mediaType },
+      'Telegram photo downloaded',
+    );
     return { mediaType, data: base64 };
   } catch (err) {
     logger.error({ fileId, err }, 'Failed to download Telegram photo');
