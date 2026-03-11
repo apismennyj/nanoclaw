@@ -42,6 +42,11 @@ export interface RegisteredGroup {
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
 }
 
+export interface ImageAttachment {
+  mediaType: 'image/jpeg' | 'image/png' | 'image/webp' | 'image/gif';
+  data: string; // base64
+}
+
 export interface NewMessage {
   id: string;
   chat_jid: string;
@@ -51,6 +56,7 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  attachments?: ImageAttachment[];
 }
 
 export interface ScheduledTask {

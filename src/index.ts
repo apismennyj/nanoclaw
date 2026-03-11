@@ -55,7 +55,7 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { Channel, ImageAttachment, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -66,6 +66,10 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+// In-memory store for image attachments keyed by message ID.
+// Cleared after the message is processed by the agent.
+const imageAttachments = new Map<string, ImageAttachment[]>();
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -179,6 +183,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
+  // Collect image attachments for these messages (in-memory, not in DB)
+  const images: ImageAttachment[] = [];
+  for (const msg of missedMessages) {
+    const atts = imageAttachments.get(msg.id);
+    if (atts) {
+      images.push(...atts);
+      imageAttachments.delete(msg.id);
+    }
+  }
+
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -187,7 +201,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, messageCount: missedMessages.length, imageCount: images.length },
     'Processing messages',
   );
 
@@ -210,7 +224,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let outputSentToUser = false;
   let lastErrorMessage = '';
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
+  const output = await runAgent(group, prompt, chatJid, images, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw =
@@ -287,6 +301,7 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  images: ImageAttachment[],
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
@@ -338,6 +353,7 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        images: images.length > 0 ? images : undefined,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -531,6 +547,10 @@ async function main(): Promise<void> {
         }
       }
       storeMessage(msg);
+      // Store image attachments in-memory (not in DB — base64 is too large)
+      if (msg.attachments && msg.attachments.length > 0) {
+        imageAttachments.set(msg.id, msg.attachments);
+      }
     },
     onChatMetadata: (
       chatJid: string,
