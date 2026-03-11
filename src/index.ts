@@ -274,6 +274,34 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
+    // Update reaction to error status
+    try {
+      const updateStatusFn = (channel as any).updatePendingMessageStatus;
+      if (typeof updateStatusFn === 'function') {
+        await updateStatusFn.call(channel, chatJid, 'error');
+      }
+    } catch (err) {
+      logger.debug({ chatJid, err }, 'Failed to update error reaction');
+    }
+
+    // Always notify user about the error details so they know what to do
+    const errLower = lastErrorMessage.toLowerCase();
+    const isRateLimit =
+      errLower.includes('rate limit') ||
+      errLower.includes('capacity') ||
+      errLower.includes('usage limit') ||
+      errLower.includes('too many requests') ||
+      errLower.includes('429') ||
+      errLower.includes('overloaded');
+    const userMsg = isRateLimit
+      ? '⚠️ Claude usage limit hit. Will retry when it resets (usually within a few hours).'
+      : `⚠️ Error: ${lastErrorMessage || 'Unknown error'}`;
+    try {
+      await channel.sendMessage(chatJid, userMsg);
+    } catch (notifyErr) {
+      logger.warn({ notifyErr }, 'Failed to send error notification');
+    }
+
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
@@ -284,24 +312,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
 
-    // Notify user about the error
-    const errLower = lastErrorMessage.toLowerCase();
-    const isRateLimit =
-      errLower.includes('rate limit') ||
-      errLower.includes('capacity') ||
-      errLower.includes('usage limit') ||
-      errLower.includes('too many requests') ||
-      errLower.includes('429') ||
-      errLower.includes('overloaded');
-    const userMsg = isRateLimit
-      ? '⚠️ Hit Claude usage limit. Will retry when it resets (usually within a few hours).'
-      : `⚠️ Agent error — will retry on your next message.${lastErrorMessage ? ` (${lastErrorMessage.slice(0, 120)})` : ''}`;
-    try {
-      await channel.sendMessage(chatJid, userMsg);
-    } catch (notifyErr) {
-      logger.warn({ notifyErr }, 'Failed to send error notification');
-    }
-
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
@@ -310,6 +320,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       'Agent error, rolled back message cursor for retry',
     );
     return false;
+  }
+
+  // Update reaction to success status
+  try {
+    const updateStatusFn = (channel as any).updatePendingMessageStatus;
+    if (typeof updateStatusFn === 'function') {
+      await updateStatusFn.call(channel, chatJid, 'success');
+    }
+  } catch (err) {
+    logger.debug({ chatJid, err }, 'Failed to update success reaction');
   }
 
   return true;
@@ -475,7 +495,9 @@ async function startMessageLoop(): Promise<void> {
           // If any pending message has an image attachment, don't pipe to an
           // active container — images can't travel over stdin IPC. Force a new
           // container so processGroupMessages can pass them as multimodal content.
-          const hasImages = messagesToSend.some((m) => imageAttachments.has(m.id));
+          const hasImages = messagesToSend.some((m) =>
+            imageAttachments.has(m.id),
+          );
 
           if (!hasImages && queue.sendMessage(chatJid, formatted)) {
             logger.debug(

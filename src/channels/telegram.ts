@@ -139,6 +139,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private pendingMessages = new Map<string, number[]>(); // Track pending message IDs per chat (queue)
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -182,6 +183,7 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const sender = ctx.from?.id.toString() || '';
       const msgId = ctx.message.message_id.toString();
+      const msgIdNum = ctx.message.message_id;
 
       // Determine chat name
       const chatName =
@@ -241,6 +243,15 @@ export class TelegramChannel implements Channel {
         is_from_me: false,
       });
 
+      // React to show message is being processed
+      await this.setReaction(chatJid, msgIdNum, '🤔');
+
+      // Track message ID for status update when processing completes
+      if (!this.pendingMessages.has(chatJid)) {
+        this.pendingMessages.set(chatJid, []);
+      }
+      this.pendingMessages.get(chatJid)!.push(msgIdNum);
+
       logger.info(
         { chatJid, chatName, sender: senderName },
         'Telegram message stored',
@@ -248,7 +259,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Handle non-text messages with placeholders so the agent knows something was sent
-    const storeNonText = (ctx: any, placeholder: string) => {
+    const storeNonText = async (ctx: any, placeholder: string) => {
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
@@ -279,6 +290,15 @@ export class TelegramChannel implements Channel {
         timestamp,
         is_from_me: false,
       });
+
+      // React to show message is being processed
+      await this.setReaction(chatJid, ctx.message.message_id, '🤔');
+
+      // Track message ID for status update when processing completes
+      if (!this.pendingMessages.has(chatJid)) {
+        this.pendingMessages.set(chatJid, []);
+      }
+      this.pendingMessages.get(chatJid)!.push(ctx.message.message_id);
     };
 
     this.bot.on('message:photo', async (ctx) => {
@@ -293,15 +313,28 @@ export class TelegramChannel implements Channel {
         ctx.from?.id?.toString() ||
         'Unknown';
       const caption = ctx.message.caption || '';
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
 
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
 
       // Pick second-to-last size (high quality but not the raw original)
       const photos = ctx.message.photo;
-      const photo = photos.length > 1 ? photos[photos.length - 2] : photos[photos.length - 1];
+      const photo =
+        photos.length > 1
+          ? photos[photos.length - 2]
+          : photos[photos.length - 1];
 
-      const attachment = await downloadTelegramPhoto(this.botToken, photo.file_id);
+      const attachment = await downloadTelegramPhoto(
+        this.botToken,
+        photo.file_id,
+      );
 
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
@@ -313,6 +346,9 @@ export class TelegramChannel implements Channel {
         is_from_me: false,
         attachments: attachment ? [attachment] : undefined,
       });
+
+      // React to show message is being processed
+      await this.setReaction(chatJid, ctx.message.message_id, '🤔');
     });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
@@ -403,6 +439,38 @@ export class TelegramChannel implements Channel {
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
+  }
+
+  async setReaction(
+    jid: string,
+    messageId: number,
+    emoji: string,
+  ): Promise<void> {
+    if (!this.bot) return;
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      await this.bot.api.setMessageReaction(numericId, messageId, [
+        { type: 'emoji', emoji } as any,
+      ]);
+      logger.debug(
+        { jid, messageId, emoji },
+        'Telegram reaction set',
+      );
+    } catch (err) {
+      logger.debug({ jid, messageId, emoji, err }, 'Failed to set Telegram reaction');
+    }
+  }
+
+  async updatePendingMessageStatus(
+    jid: string,
+    status: 'success' | 'error',
+  ): Promise<void> {
+    const pending = this.pendingMessages.get(jid);
+    if (!pending || pending.length === 0) return;
+
+    const messageId = pending.shift()!; // Remove and get the first pending message
+    const emoji = status === 'success' ? '✅' : '❌';
+    await this.setReaction(jid, messageId, emoji);
   }
 }
 
