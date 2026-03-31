@@ -98,7 +98,10 @@ export interface Channel {
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
   // Optional: update pending message status with final reaction. Channels that support it implement it.
-  updatePendingMessageStatus?(jid: string, status: 'success' | 'error'): Promise<void>;
+  updatePendingMessageStatus?(
+    jid: string,
+    status: 'success' | 'error',
+  ): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

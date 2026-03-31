@@ -120,9 +120,7 @@ function createSchema(database: Database.Database): void {
 
   // Add platform_message_id column if it doesn't exist (migration for existing DBs)
   try {
-    database.exec(
-      `ALTER TABLE messages ADD COLUMN platform_message_id TEXT`,
-    );
+    database.exec(`ALTER TABLE messages ADD COLUMN platform_message_id TEXT`);
   } catch {
     /* column already exists */
   }

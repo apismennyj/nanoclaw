@@ -19,21 +19,32 @@ import {
 
 const execAsync = promisify(exec);
 
-async function setReaction(botToken: string, chatId: number | string, messageId: number, emoji: string): Promise<void> {
+async function setReaction(
+  botToken: string,
+  chatId: number | string,
+  messageId: number,
+  emoji: string,
+): Promise<void> {
   try {
     // Set reaction (replaces existing ones)
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/setMessageReaction`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: messageId,
-        reaction: [{ type: 'emoji', emoji }],
-        is_big: false
-      })
-    });
+    const res = await fetch(
+      `https://api.telegram.org/bot${botToken}/setMessageReaction`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          reaction: [{ type: 'emoji', emoji }],
+          is_big: false,
+        }),
+      },
+    );
     const data = await res.json();
-    logger.info({ emoji, messageId, chatId, status: res.status, response: data }, 'Set reaction result');
+    logger.info(
+      { emoji, messageId, chatId, status: res.status, response: data },
+      'Set reaction result',
+    );
   } catch (err) {
     logger.error({ err, emoji, messageId, chatId }, 'setReaction failed');
   }
@@ -102,7 +113,9 @@ async function transcribeVoiceMessage(
     // Convert OGG to WAV if needed
     logger.info({ voiceFile }, 'Converting voice to WAV');
     try {
-      await execAsync(`ffmpeg -i "${voiceFile}" -ar 16000 -ac 1 -c:a pcm_s16le -y "${wavFile}"`);
+      await execAsync(
+        `ffmpeg -i "${voiceFile}" -ar 16000 -ac 1 -c:a pcm_s16le -y "${wavFile}"`,
+      );
     } catch {
       // If conversion fails, try to use the OGG file directly
       logger.warn(
@@ -362,7 +375,12 @@ export class TelegramChannel implements Channel {
         this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
 
         // RIGHT AFTER receiving the message: set 👀 reaction
-        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
+        await setReaction(
+          this.botToken,
+          ctx.chat.id,
+          ctx.message.message_id,
+          '👀',
+        );
 
         // Deliver message — startMessageLoop() will pick it up
         this.opts.onMessage(chatJid, {
@@ -418,7 +436,12 @@ export class TelegramChannel implements Channel {
         // Store the message ID for later status updates
         this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
 
-        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
+        await setReaction(
+          this.botToken,
+          ctx.chat.id,
+          ctx.message.message_id,
+          '👀',
+        );
 
         this.opts.onMessage(chatJid, {
           id: ctx.message.message_id.toString(),
@@ -463,7 +486,12 @@ export class TelegramChannel implements Channel {
         this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
 
         // React to show message is being processed
-        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
+        await setReaction(
+          this.botToken,
+          ctx.chat.id,
+          ctx.message.message_id,
+          '👀',
+        );
 
         // Pick second-to-last size (high quality but not the raw original)
         const photos = ctx.message.photo;
@@ -519,7 +547,12 @@ export class TelegramChannel implements Channel {
         // Store the message ID for later status updates
         this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
 
-        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
+        await setReaction(
+          this.botToken,
+          ctx.chat.id,
+          ctx.message.message_id,
+          '👀',
+        );
 
         // Transcribe the voice message
         const transcript = await transcribeVoiceMessage(
@@ -630,7 +663,10 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  async updatePendingMessageStatus(jid: string, status: 'success' | 'error'): Promise<void> {
+  async updatePendingMessageStatus(
+    jid: string,
+    status: 'success' | 'error',
+  ): Promise<void> {
     let messageId: number | undefined = this.lastMessageIdPerChat.get(jid);
 
     // If not in memory, try to get from database
@@ -642,7 +678,10 @@ export class TelegramChannel implements Channel {
     }
 
     if (!messageId) {
-      logger.debug({ jid }, 'No recent message ID found for status update, unable to set reaction');
+      logger.debug(
+        { jid },
+        'No recent message ID found for status update, unable to set reaction',
+      );
       return;
     }
 
@@ -651,12 +690,17 @@ export class TelegramChannel implements Channel {
 
     try {
       await setReaction(this.botToken, numericId, messageId, emoji);
-      logger.info({ jid, messageId, emoji, status }, 'Updated pending message status');
+      logger.info(
+        { jid, messageId, emoji, status },
+        'Updated pending message status',
+      );
     } catch (err) {
-      logger.debug({ jid, messageId, emoji, status, err }, 'Failed to update pending message status');
+      logger.debug(
+        { jid, messageId, emoji, status, err },
+        'Failed to update pending message status',
+      );
     }
   }
-
 }
 
 registerChannel('telegram', (opts: ChannelOpts) => {

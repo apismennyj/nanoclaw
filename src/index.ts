@@ -225,23 +225,47 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     try {
       await channel.setTyping?.(chatJid, true);
       const ollamaSystemPrompt = `You are Neadmishka, a helpful personal assistant. You communicate in Ukrainian by default (switch to Russian or English only if explicitly asked). Be concise and helpful.`;
-      const ollamaResponse = await askOllama(missedMessages, ollamaSystemPrompt);
+      const ollamaResponse = await askOllama(
+        missedMessages,
+        ollamaSystemPrompt,
+      );
       await channel.setTyping?.(chatJid, false);
+      // Detect "wrong model" responses — a misconfigured model sometimes acts as a
+      // video-download bot and returns help text instead of answering the message.
+      const JUNK_PATTERNS = [
+        /please send a video url/i,
+        /use \/help/i,
+        /^i('m| am) a (video|download)/i,
+      ];
+      const isJunk = JUNK_PATTERNS.some((p) => p.test(ollamaResponse));
+      if (isJunk) {
+        throw new Error(`Ollama returned junk response: ${ollamaResponse.slice(0, 80)}`);
+      }
       if (ollamaResponse) {
         await channel.sendMessage(chatJid, ollamaResponse + '\n🖥️');
-        channel.updatePendingMessageStatus?.(chatJid, 'success').catch(() => {});
+        channel
+          .updatePendingMessageStatus?.(chatJid, 'success')
+          .catch(() => {});
       }
-      logger.info({ route: 'ollama', hasImages, group: group.name }, 'Routed to local model');
+      logger.info(
+        { route: 'ollama', hasImages, group: group.name },
+        'Routed to local model',
+      );
       return true;
     } catch (err) {
       await channel.setTyping?.(chatJid, false);
-      logger.warn({ err, group: group.name }, 'Ollama failed, falling back to Claude');
+      logger.warn(
+        { err, group: group.name },
+        'Ollama failed, falling back to Claude',
+      );
       // Notify user if image couldn't be processed locally
       if (hasImages) {
-        channel.sendMessage(
-          chatJid,
-          '⚠️ Локальна модель не впоралась з картинкою — відправляю в Claude (витрачаються токени)',
-        ).catch(() => {});
+        channel
+          .sendMessage(
+            chatJid,
+            '⚠️ Локальна модель не впоралась з картинкою — відправляю в Claude (витрачаються токени)',
+          )
+          .catch(() => {});
       }
       // Fall through to Claude processing below
     }
@@ -289,7 +313,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           await channel.sendMessage(chatJid, text + '\n☁️');
           outputSentToUser = true;
           // Set success reaction immediately after sending response
-          channel.updatePendingMessageStatus?.(chatJid, 'success').catch(() => {});
+          channel
+            .updatePendingMessageStatus?.(chatJid, 'success')
+            .catch(() => {});
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
         resetIdleTimer();
@@ -313,12 +339,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Update reaction to error status
     try {
       const updateStatusFn = (channel as any).updatePendingMessageStatus;
-      logger.info({ chatJid, hasFn: typeof updateStatusFn }, '❌ Attempting to set error reaction');
+      logger.info(
+        { chatJid, hasFn: typeof updateStatusFn },
+        '❌ Attempting to set error reaction',
+      );
       if (typeof updateStatusFn === 'function') {
         await updateStatusFn.call(channel, chatJid, 'error');
         logger.info({ chatJid }, '❌ Error reaction updated');
       } else {
-        logger.warn({ chatJid, fnType: typeof updateStatusFn }, '⚠️ updatePendingMessageStatus not a function');
+        logger.warn(
+          { chatJid, fnType: typeof updateStatusFn },
+          '⚠️ updatePendingMessageStatus not a function',
+        );
       }
     } catch (err) {
       logger.debug({ chatJid, err }, 'Failed to update error reaction');
@@ -365,12 +397,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Update reaction to success status
   try {
     const updateStatusFn = (channel as any).updatePendingMessageStatus;
-    logger.info({ chatJid, hasFn: typeof updateStatusFn }, '✅ Attempting to set success reaction');
+    logger.info(
+      { chatJid, hasFn: typeof updateStatusFn },
+      '✅ Attempting to set success reaction',
+    );
     if (typeof updateStatusFn === 'function') {
       await updateStatusFn.call(channel, chatJid, 'success');
       logger.info({ chatJid }, '✅ Success reaction updated');
     } else {
-      logger.warn({ chatJid, fnType: typeof updateStatusFn }, '⚠️ updatePendingMessageStatus not a function');
+      logger.warn(
+        { chatJid, fnType: typeof updateStatusFn },
+        '⚠️ updatePendingMessageStatus not a function',
+      );
     }
   } catch (err) {
     logger.debug({ chatJid, err }, 'Failed to update success reaction');
