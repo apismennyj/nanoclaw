@@ -32,6 +32,7 @@ function createSchema(database: Database.Database): void {
       timestamp TEXT,
       is_from_me INTEGER,
       is_bot_message INTEGER DEFAULT 0,
+      platform_message_id TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -82,6 +83,17 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS api_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      chat_jid TEXT,
+      model TEXT,
+      input_tokens INTEGER DEFAULT 0,
+      output_tokens INTEGER DEFAULT 0,
+      cache_read_tokens INTEGER DEFAULT 0,
+      cache_write_tokens INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_usage_timestamp ON api_usage(timestamp);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -102,6 +114,15 @@ function createSchema(database: Database.Database): void {
     database
       .prepare(`UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`)
       .run(`${ASSISTANT_NAME}:%`);
+  } catch {
+    /* column already exists */
+  }
+
+  // Add platform_message_id column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN platform_message_id TEXT`,
+    );
   } catch {
     /* column already exists */
   }
@@ -262,7 +283,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, platform_message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -272,6 +293,7 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.platform_message_id || null,
   );
 }
 
@@ -349,7 +371,7 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, platform_message_id
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -361,6 +383,19 @@ export function getMessagesSince(
   return db
     .prepare(sql)
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+}
+
+/**
+ * Get the platform message ID of the most recent message in a chat.
+ * Used to set reactions on messages being processed.
+ */
+export function getLatestMessageIdForChat(chatJid: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT platform_message_id FROM messages WHERE chat_jid = ? AND is_bot_message = 0 ORDER BY timestamp DESC LIMIT 1`,
+    )
+    .get(chatJid) as { platform_message_id: string | null } | undefined;
+  return row?.platform_message_id || null;
 }
 
 export function createTask(
@@ -632,6 +667,35 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- API usage logging ---
+
+export function logApiUsage(usage: {
+  chat_jid?: string;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+}): void {
+  const now = new Date().toISOString();
+  try {
+    db.prepare(
+      `INSERT INTO api_usage (timestamp, chat_jid, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      now,
+      usage.chat_jid || null,
+      usage.model || null,
+      usage.input_tokens || 0,
+      usage.output_tokens || 0,
+      usage.cache_read_tokens || 0,
+      usage.cache_write_tokens || 0,
+    );
+  } catch (err) {
+    // Non-fatal: don't break request handling if usage logging fails
+  }
 }
 
 // --- JSON migration ---

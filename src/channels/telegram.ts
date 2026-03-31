@@ -1,8 +1,13 @@
 import { Api, Bot } from 'grammy';
+import { exec } from 'child_process';
+import { promises as fs } from 'fs';
+import * as path from 'path';
+import { promisify } from 'util';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { downloadTelegramPhoto } from '../image.js';
+import { getLatestMessageIdForChat } from '../db.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -11,6 +16,28 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+const execAsync = promisify(exec);
+
+async function setReaction(botToken: string, chatId: number | string, messageId: number, emoji: string): Promise<void> {
+  try {
+    // Set reaction (replaces existing ones)
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/setMessageReaction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: [{ type: 'emoji', emoji }],
+        is_big: false
+      })
+    });
+    const data = await res.json();
+    logger.info({ emoji, messageId, chatId, status: res.status, response: data }, 'Set reaction result');
+  } catch (err) {
+    logger.error({ err, emoji, messageId, chatId }, 'setReaction failed');
+  }
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -23,6 +50,104 @@ export interface TelegramChannelOpts {
  * Claude's output naturally matches Telegram's Markdown v1 format:
  *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
  */
+async function downloadTelegramFile(
+  botToken: string,
+  fileId: string,
+): Promise<Buffer> {
+  try {
+    // Get file path from Telegram
+    const getFileUrl = `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`;
+    const getFileResponse = await fetch(getFileUrl);
+    const getFileData = (await getFileResponse.json()) as {
+      ok: boolean;
+      result?: { file_path: string };
+    };
+
+    if (!getFileData.ok || !getFileData.result?.file_path) {
+      throw new Error('Failed to get file path from Telegram');
+    }
+
+    // Download file
+    const downloadUrl = `https://api.telegram.org/file/bot${botToken}/${getFileData.result.file_path}`;
+    const response = await fetch(downloadUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to download file: ${response.statusText}`);
+    }
+
+    return Buffer.from(await response.arrayBuffer());
+  } catch (err) {
+    logger.error({ err }, 'Failed to download Telegram file');
+    throw err;
+  }
+}
+
+async function transcribeVoiceMessage(
+  botToken: string,
+  fileId: string,
+): Promise<string> {
+  const tempDir = '/tmp';
+  const ts = Date.now();
+  const voiceFile = path.join(tempDir, `voice_${ts}.ogg`);
+  const wavFile = path.join(tempDir, `voice_${ts}.wav`);
+  const whisperPath = '/home/pav/ai-agents/whisper.cpp';
+  const modelPath = `${whisperPath}/models/ggml-small.bin`;
+  const whisperBin = `${whisperPath}/build/bin/whisper-cli`;
+
+  try {
+    // Download voice file
+    logger.info({ fileId }, 'Downloading voice message');
+    const audioBuffer = await downloadTelegramFile(botToken, fileId);
+    await fs.writeFile(voiceFile, audioBuffer);
+
+    // Convert OGG to WAV if needed
+    logger.info({ voiceFile }, 'Converting voice to WAV');
+    try {
+      await execAsync(`ffmpeg -i "${voiceFile}" -ar 16000 -ac 1 -c:a pcm_s16le -y "${wavFile}"`);
+    } catch {
+      // If conversion fails, try to use the OGG file directly
+      logger.warn(
+        'WAV conversion failed, attempting transcription on OGG file',
+      );
+    }
+
+    const audioPath = await fs
+      .access(wavFile)
+      .then(() => wavFile)
+      .catch(() => voiceFile);
+
+    // Transcribe using whisper.cpp
+    logger.info({ audioPath }, 'Transcribing voice message');
+    const { stdout, stderr } = await execAsync(
+      `"${whisperBin}" -m "${modelPath}" -l uk --no-timestamps -f "${audioPath}"`,
+      { maxBuffer: 10 * 1024 * 1024 },
+    );
+
+    if (!stdout && stderr) {
+      logger.error({ stderr }, 'Whisper transcription failed');
+      throw new Error(`Transcription error: ${stderr}`);
+    }
+
+    const transcript = stdout.trim();
+    logger.info({ transcript }, 'Voice transcribed successfully');
+
+    // Clean up temp files
+    await Promise.all([
+      fs.unlink(voiceFile).catch(() => {}),
+      fs.unlink(wavFile).catch(() => {}),
+    ]);
+
+    return transcript;
+  } catch (err) {
+    logger.error({ err, fileId }, 'Voice transcription failed');
+    // Clean up on error
+    await Promise.all([
+      fs.unlink(voiceFile).catch(() => {}),
+      fs.unlink(wavFile).catch(() => {}),
+    ]);
+    throw err;
+  }
+}
+
 async function sendTelegramMessage(
   api: { sendMessage: Api['sendMessage'] },
   chatId: string | number,
@@ -139,7 +264,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
-  private pendingMessages = new Map<string, number[]>(); // Track pending message IDs per chat (queue)
+  private lastMessageIdPerChat: Map<string, number> = new Map();
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -232,29 +357,32 @@ export class TelegramChannel implements Channel {
         return;
       }
 
-      // Deliver message — startMessageLoop() will pick it up
-      this.opts.onMessage(chatJid, {
-        id: msgId,
-        chat_jid: chatJid,
-        sender,
-        sender_name: senderName,
-        content,
-        timestamp,
-        is_from_me: false,
-      });
+      try {
+        // Store the message ID for later status updates
+        this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
 
-      // React to show message is being processed
-      await this.setReaction(chatJid, msgIdNum, '👀');
+        // RIGHT AFTER receiving the message: set 👀 reaction
+        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
 
-      // Track message ID for status update when processing completes
-      if (!this.pendingMessages.has(chatJid)) {
-        this.pendingMessages.set(chatJid, []);
+        // Deliver message — startMessageLoop() will pick it up
+        this.opts.onMessage(chatJid, {
+          id: msgId,
+          chat_jid: chatJid,
+          sender,
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+          platform_message_id: ctx.message.message_id.toString(),
+        });
+
+        // Final reaction (👍/👎) will be set via updatePendingMessageStatus()
+        // when processing completes in index.ts
+      } catch (err) {
+        logger.error({ err, chatJid }, 'Error processing message');
+        // Final reaction (👍/👎) will be set via updatePendingMessageStatus()
+        // when processing completes in index.ts
       }
-      this.pendingMessages.get(chatJid)!.push(msgIdNum);
-      logger.info(
-        { chatJid, msgIdNum, pending: this.pendingMessages.get(chatJid)!.length },
-        'Message added to pending queue',
-      );
 
       logger.info(
         { chatJid, chatName, sender: senderName },
@@ -285,24 +413,26 @@ export class TelegramChannel implements Channel {
         'telegram',
         isGroup,
       );
-      this.opts.onMessage(chatJid, {
-        id: ctx.message.message_id.toString(),
-        chat_jid: chatJid,
-        sender: ctx.from?.id?.toString() || '',
-        sender_name: senderName,
-        content: `${placeholder}${caption}`,
-        timestamp,
-        is_from_me: false,
-      });
 
-      // React to show message is being processed
-      await this.setReaction(chatJid, ctx.message.message_id, '👀');
+      try {
+        // Store the message ID for later status updates
+        this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
 
-      // Track message ID for status update when processing completes
-      if (!this.pendingMessages.has(chatJid)) {
-        this.pendingMessages.set(chatJid, []);
+        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
+
+        this.opts.onMessage(chatJid, {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content: `${placeholder}${caption}`,
+          timestamp,
+          is_from_me: false,
+          platform_message_id: ctx.message.message_id.toString(),
+        });
+      } catch (err) {
+        logger.error({ err, chatJid }, 'Error in storeNonText');
       }
-      this.pendingMessages.get(chatJid)!.push(ctx.message.message_id);
     };
 
     this.bot.on('message:photo', async (ctx) => {
@@ -328,34 +458,89 @@ export class TelegramChannel implements Channel {
         isGroup,
       );
 
-      // Pick second-to-last size (high quality but not the raw original)
-      const photos = ctx.message.photo;
-      const photo =
-        photos.length > 1
-          ? photos[photos.length - 2]
-          : photos[photos.length - 1];
+      try {
+        // Store the message ID for later status updates
+        this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
 
-      const attachment = await downloadTelegramPhoto(
-        this.botToken,
-        photo.file_id,
-      );
+        // React to show message is being processed
+        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
 
-      this.opts.onMessage(chatJid, {
-        id: ctx.message.message_id.toString(),
-        chat_jid: chatJid,
-        sender: ctx.from?.id?.toString() || '',
-        sender_name: senderName,
-        content: caption || '[Photo]',
-        timestamp,
-        is_from_me: false,
-        attachments: attachment ? [attachment] : undefined,
-      });
+        // Pick second-to-last size (high quality but not the raw original)
+        const photos = ctx.message.photo;
+        const photo =
+          photos.length > 1
+            ? photos[photos.length - 2]
+            : photos[photos.length - 1];
 
-      // React to show message is being processed
-      await this.setReaction(chatJid, ctx.message.message_id, '👀');
+        const attachment = await downloadTelegramPhoto(
+          this.botToken,
+          photo.file_id,
+        );
+
+        this.opts.onMessage(chatJid, {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content: caption || '[Photo]',
+          timestamp,
+          is_from_me: false,
+          attachments: attachment ? [attachment] : undefined,
+          platform_message_id: ctx.message.message_id.toString(),
+        });
+      } catch (err) {
+        logger.error({ err, chatJid }, 'Error processing photo');
+      }
     });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      try {
+        // Store the message ID for later status updates
+        this.lastMessageIdPerChat.set(chatJid, ctx.message.message_id);
+
+        await setReaction(this.botToken, ctx.chat.id, ctx.message.message_id, '👀');
+
+        // Transcribe the voice message
+        const transcript = await transcribeVoiceMessage(
+          this.botToken,
+          ctx.message.voice!.file_id,
+        );
+
+        this.opts.onMessage(chatJid, {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content: `[Voice]: ${transcript}`,
+          timestamp,
+          is_from_me: false,
+          platform_message_id: ctx.message.message_id.toString(),
+        });
+      } catch (err) {
+        logger.error({ err, chatJid }, 'Failed to transcribe voice message');
+      }
+    });
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
@@ -445,49 +630,33 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  async setReaction(
-    jid: string,
-    messageId: number,
-    emoji: string,
-  ): Promise<void> {
-    if (!this.bot) return;
-    try {
-      const numericId = jid.replace(/^tg:/, '');
-      // First clear all existing reactions
-      await this.bot.api.setMessageReaction(numericId, messageId, [] as any);
-      // Small delay to ensure clear completes before setting new reaction
-      await new Promise((r) => setTimeout(r, 100));
-      // Then set the new reaction
-      const reaction = { type: 'emoji', emoji };
-      logger.info({ jid, messageId, emoji, reactionObj: reaction }, 'Setting Telegram reaction');
-      await this.bot.api.setMessageReaction(numericId, messageId, [reaction] as any);
-      logger.info({ jid, messageId, emoji }, 'Telegram reaction set successfully');
-    } catch (err) {
-      logger.warn(
-        { jid, messageId, emoji, err: (err as any)?.message || String(err) },
-        'Failed to set Telegram reaction',
-      );
-    }
-  }
+  async updatePendingMessageStatus(jid: string, status: 'success' | 'error'): Promise<void> {
+    let messageId: number | undefined = this.lastMessageIdPerChat.get(jid);
 
-  async updatePendingMessageStatus(
-    jid: string,
-    status: 'success' | 'error',
-  ): Promise<void> {
-    const pending = this.pendingMessages.get(jid);
-    if (!pending || pending.length === 0) {
-      logger.warn({ jid, status, pendingCount: pending?.length || 0 }, 'No pending messages to update status');
+    // If not in memory, try to get from database
+    if (!messageId) {
+      const dbMessageId = getLatestMessageIdForChat(jid);
+      if (dbMessageId) {
+        messageId = parseInt(dbMessageId, 10);
+      }
+    }
+
+    if (!messageId) {
+      logger.debug({ jid }, 'No recent message ID found for status update, unable to set reaction');
       return;
     }
 
-    const messageId = pending.shift()!; // Remove and get the first pending message
-    const emoji = status === 'success' ? '✅' : '❌';
-    logger.info(
-      { jid, messageId, status, emoji, remainingPending: pending.length },
-      'Updating message status reaction',
-    );
-    await this.setReaction(jid, messageId, emoji);
+    const emoji = status === 'success' ? '👍' : '👎';
+    const numericId = jid.replace(/^tg:/, '');
+
+    try {
+      await setReaction(this.botToken, numericId, messageId, emoji);
+      logger.info({ jid, messageId, emoji, status }, 'Updated pending message status');
+    } catch (err) {
+      logger.debug({ jid, messageId, emoji, status, err }, 'Failed to update pending message status');
+    }
   }
+
 }
 
 registerChannel('telegram', (opts: ChannelOpts) => {

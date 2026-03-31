@@ -57,6 +57,7 @@ export interface NewMessage {
   is_from_me?: boolean;
   is_bot_message?: boolean;
   attachments?: ImageAttachment[];
+  platform_message_id?: string; // e.g., Telegram messageId as string
 }
 
 export interface ScheduledTask {
@@ -96,6 +97,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: update pending message status with final reaction. Channels that support it implement it.
+  updatePendingMessageStatus?(jid: string, status: 'success' | 'error'): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

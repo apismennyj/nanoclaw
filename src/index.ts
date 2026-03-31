@@ -38,6 +38,7 @@ import {
   getRegisteredGroup,
   getRouterState,
   initDatabase,
+  logApiUsage,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -63,6 +64,7 @@ import {
   RegisteredGroup,
 } from './types.js';
 import { logger } from './logger.js';
+import { classifyRequest, askOllama } from './ollama-router.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -215,6 +217,37 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  // --- Ollama routing: route simple messages and images to local model ---
+  // qwen3.5 is multimodal — handles both text and image messages locally
+  const hasImages = images.length > 0;
+  const route = classifyRequest(missedMessages);
+  if (route === 'local' || hasImages) {
+    try {
+      await channel.setTyping?.(chatJid, true);
+      const ollamaSystemPrompt = `You are Neadmishka, a helpful personal assistant. You communicate in Ukrainian by default (switch to Russian or English only if explicitly asked). Be concise and helpful.`;
+      const ollamaResponse = await askOllama(missedMessages, ollamaSystemPrompt);
+      await channel.setTyping?.(chatJid, false);
+      if (ollamaResponse) {
+        await channel.sendMessage(chatJid, ollamaResponse + '\n🖥️');
+        channel.updatePendingMessageStatus?.(chatJid, 'success').catch(() => {});
+      }
+      logger.info({ route: 'ollama', hasImages, group: group.name }, 'Routed to local model');
+      return true;
+    } catch (err) {
+      await channel.setTyping?.(chatJid, false);
+      logger.warn({ err, group: group.name }, 'Ollama failed, falling back to Claude');
+      // Notify user if image couldn't be processed locally
+      if (hasImages) {
+        channel.sendMessage(
+          chatJid,
+          '⚠️ Локальна модель не впоралась з картинкою — відправляю в Claude (витрачаються токени)',
+        ).catch(() => {});
+      }
+      // Fall through to Claude processing below
+    }
+  }
+  // --- End Ollama routing ---
+
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -253,8 +286,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           `Agent output: ${raw.slice(0, 200)}`,
         );
         if (text) {
-          await channel.sendMessage(chatJid, text);
+          await channel.sendMessage(chatJid, text + '\n☁️');
           outputSentToUser = true;
+          // Set success reaction immediately after sending response
+          channel.updatePendingMessageStatus?.(chatJid, 'success').catch(() => {});
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
         resetIdleTimer();
@@ -278,8 +313,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Update reaction to error status
     try {
       const updateStatusFn = (channel as any).updatePendingMessageStatus;
+      logger.info({ chatJid, hasFn: typeof updateStatusFn }, '❌ Attempting to set error reaction');
       if (typeof updateStatusFn === 'function') {
         await updateStatusFn.call(channel, chatJid, 'error');
+        logger.info({ chatJid }, '❌ Error reaction updated');
+      } else {
+        logger.warn({ chatJid, fnType: typeof updateStatusFn }, '⚠️ updatePendingMessageStatus not a function');
       }
     } catch (err) {
       logger.debug({ chatJid, err }, 'Failed to update error reaction');
@@ -326,8 +365,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Update reaction to success status
   try {
     const updateStatusFn = (channel as any).updatePendingMessageStatus;
+    logger.info({ chatJid, hasFn: typeof updateStatusFn }, '✅ Attempting to set success reaction');
     if (typeof updateStatusFn === 'function') {
       await updateStatusFn.call(channel, chatJid, 'success');
+      logger.info({ chatJid }, '✅ Success reaction updated');
+    } else {
+      logger.warn({ chatJid, fnType: typeof updateStatusFn }, '⚠️ updatePendingMessageStatus not a function');
     }
   } catch (err) {
     logger.debug({ chatJid, err }, 'Failed to update success reaction');
@@ -560,6 +603,15 @@ async function main(): Promise<void> {
   const proxyServer = await startCredentialProxy(
     CREDENTIAL_PROXY_PORT,
     PROXY_BIND_HOST,
+    (usage) => {
+      logApiUsage({
+        model: usage.model,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+      });
+    },
   );
 
   // Graceful shutdown handlers
