@@ -14,39 +14,13 @@ const OLLAMA_TIMEOUT_MS = 300_000; // 5 min — qwen3.5:4b on CPU can be slow
 // Keywords that indicate the request requires tools or complex processing
 const TOOL_KEYWORDS = [
   // Ukrainian
-  'знайди',
-  'пошукай',
-  'відкрий',
-  'завантаж',
-  'перевір',
-  'нагадай',
-  'поставити',
-  'запусти',
-  'статс',
-  'пошта',
-  'linkedin',
-  'github',
-  'задачу',
-  'розклад',
-  'ярмарок',
-  'виправ',
-  'напиши код',
-  'фікс',
-  'патч',
-  'встанови',
+  'знайди', 'пошукай', 'відкрий', 'завантаж', 'перевір', 'нагадай',
+  'поставити', 'запусти', 'статс', 'пошта', 'linkedin', 'github',
+  'задачу', 'розклад', 'ярмарок', 'виправ', 'напиши код', 'фікс',
+  'патч', 'встанови',
   // English
-  'stats',
-  'search',
-  'find',
-  'open',
-  'download',
-  'check',
-  'remind',
-  'schedule',
-  'run',
-  'install',
-  'fix',
-  'patch',
+  'stats', 'search', 'find', 'open', 'download', 'check', 'remind',
+  'schedule', 'run', 'install', 'fix', 'patch',
 ];
 
 const URL_PATTERN = /https?:\/\/\S+/i;
@@ -112,26 +86,21 @@ async function detectOllamaModel(): Promise<string | null> {
   const ctrl = new AbortController();
   setTimeout(() => ctrl.abort(), 5_000); // 5s for tags check
   try {
-    const resp = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-      signal: ctrl.signal,
-    });
+    const resp = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: ctrl.signal });
     if (!resp.ok) return null;
 
     const data = (await resp.json()) as { models?: Array<{ name: string }> };
     const models = data.models || [];
     if (models.length === 0) return null;
 
-    // Prefer qwen3.5:4b (9b doesn't fit in 8GB RAM)
-    const priority = ['qwen3.5:4b', 'qwen3.5:9b'];
+    // Prefer custom neadmishka model (qwen3.5:4b with embedded system prompt)
+    const priority = ['neadmishka', 'qwen3.5:4b', 'qwen3.5:9b'];
     for (const p of priority) {
       const found = models.find((m) => m.name === p || m.name.startsWith(p));
       if (found) return found.name;
     }
     const preferred = models.find(
-      (m) =>
-        m.name.startsWith('qwen3.5') ||
-        m.name.startsWith('qwen3') ||
-        m.name.startsWith('qwen2.5'),
+      (m) => m.name.startsWith('qwen3.5') || m.name.startsWith('qwen3') || m.name.startsWith('qwen2.5'),
     );
     if (preferred) return preferred.name;
 

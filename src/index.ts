@@ -69,6 +69,26 @@ import { classifyRequest, askOllama } from './ollama-router.js';
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
 
+// --- Routing override: /route claude | local | auto | status ---
+const ROUTING_OVERRIDE_FILE = path.join(
+  path.dirname(new URL(import.meta.url).pathname),
+  '../../groups/telegram_main/routing_override.json',
+);
+
+function getRoutingMode(): 'auto' | 'claude' | 'local' {
+  try {
+    const data = JSON.parse(fs.readFileSync(ROUTING_OVERRIDE_FILE, 'utf8'));
+    if (['auto', 'claude', 'local'].includes(data.mode)) return data.mode;
+  } catch {}
+  return 'auto';
+}
+
+function setRoutingMode(mode: 'auto' | 'claude' | 'local'): void {
+  try {
+    fs.writeFileSync(ROUTING_OVERRIDE_FILE, JSON.stringify({ mode }) + '\n');
+  } catch {}
+}
+
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
@@ -217,55 +237,54 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  // --- /route command handling ---
+  const lastMsg = missedMessages[missedMessages.length - 1];
+  const cmdMatch = lastMsg?.content?.trim().match(/^\/route\s+(\S+)/i);
+  if (cmdMatch) {
+    const arg = cmdMatch[1].toLowerCase();
+    const modeMap: Record<string, 'auto' | 'claude' | 'local'> = {
+      auto: 'auto', claude: 'claude', local: 'local',
+      ollama: 'local', status: getRoutingMode() as any,
+    };
+    if (arg === 'status') {
+      const cur = getRoutingMode();
+      await channel.sendMessage(chatJid, `🔀 Поточний режим: *${cur}*\nКоманди: /route auto | claude | local`);
+    } else if (modeMap[arg] !== undefined) {
+      setRoutingMode(modeMap[arg] as 'auto' | 'claude' | 'local');
+      const labels: Record<string, string> = { auto: '🔀 Авто (за keywords)', claude: '☁️ Завжди Claude', local: '🖥️ Завжди Ollama' };
+      await channel.sendMessage(chatJid, `${labels[modeMap[arg]]} — режим встановлено`);
+    } else {
+      await channel.sendMessage(chatJid, `❓ Невідома команда. Використання: /route auto | claude | local | status`);
+    }
+    return true;
+  }
+
   // --- Ollama routing: route simple messages and images to local model ---
   // qwen3.5 is multimodal — handles both text and image messages locally
   const hasImages = images.length > 0;
-  const route = classifyRequest(missedMessages);
+  const overrideMode = getRoutingMode();
+  const route = overrideMode !== 'auto' ? overrideMode : classifyRequest(missedMessages);
   if (route === 'local' || hasImages) {
     try {
       await channel.setTyping?.(chatJid, true);
       const ollamaSystemPrompt = `You are Neadmishka, a helpful personal assistant. You communicate in Ukrainian by default (switch to Russian or English only if explicitly asked). Be concise and helpful.`;
-      const ollamaResponse = await askOllama(
-        missedMessages,
-        ollamaSystemPrompt,
-      );
+      const ollamaResponse = await askOllama(missedMessages, ollamaSystemPrompt);
       await channel.setTyping?.(chatJid, false);
-      // Detect "wrong model" responses — a misconfigured model sometimes acts as a
-      // video-download bot and returns help text instead of answering the message.
-      const JUNK_PATTERNS = [
-        /please send a video url/i,
-        /use \/help/i,
-        /^i('m| am) a (video|download)/i,
-      ];
-      const isJunk = JUNK_PATTERNS.some((p) => p.test(ollamaResponse));
-      if (isJunk) {
-        throw new Error(`Ollama returned junk response: ${ollamaResponse.slice(0, 80)}`);
-      }
       if (ollamaResponse) {
         await channel.sendMessage(chatJid, ollamaResponse + '\n🖥️');
-        channel
-          .updatePendingMessageStatus?.(chatJid, 'success')
-          .catch(() => {});
+        channel.updatePendingMessageStatus?.(chatJid, 'success').catch(() => {});
       }
-      logger.info(
-        { route: 'ollama', hasImages, group: group.name },
-        'Routed to local model',
-      );
+      logger.info({ route: 'ollama', hasImages, group: group.name }, 'Routed to local model');
       return true;
     } catch (err) {
       await channel.setTyping?.(chatJid, false);
-      logger.warn(
-        { err, group: group.name },
-        'Ollama failed, falling back to Claude',
-      );
+      logger.warn({ err, group: group.name }, 'Ollama failed, falling back to Claude');
       // Notify user if image couldn't be processed locally
       if (hasImages) {
-        channel
-          .sendMessage(
-            chatJid,
-            '⚠️ Локальна модель не впоралась з картинкою — відправляю в Claude (витрачаються токени)',
-          )
-          .catch(() => {});
+        channel.sendMessage(
+          chatJid,
+          '⚠️ Локальна модель не впоралась з картинкою — відправляю в Claude (витрачаються токени)',
+        ).catch(() => {});
       }
       // Fall through to Claude processing below
     }
@@ -313,9 +332,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           await channel.sendMessage(chatJid, text + '\n☁️');
           outputSentToUser = true;
           // Set success reaction immediately after sending response
-          channel
-            .updatePendingMessageStatus?.(chatJid, 'success')
-            .catch(() => {});
+          channel.updatePendingMessageStatus?.(chatJid, 'success').catch(() => {});
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
         resetIdleTimer();
@@ -339,18 +356,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Update reaction to error status
     try {
       const updateStatusFn = (channel as any).updatePendingMessageStatus;
-      logger.info(
-        { chatJid, hasFn: typeof updateStatusFn },
-        '❌ Attempting to set error reaction',
-      );
+      logger.info({ chatJid, hasFn: typeof updateStatusFn }, '❌ Attempting to set error reaction');
       if (typeof updateStatusFn === 'function') {
         await updateStatusFn.call(channel, chatJid, 'error');
         logger.info({ chatJid }, '❌ Error reaction updated');
       } else {
-        logger.warn(
-          { chatJid, fnType: typeof updateStatusFn },
-          '⚠️ updatePendingMessageStatus not a function',
-        );
+        logger.warn({ chatJid, fnType: typeof updateStatusFn }, '⚠️ updatePendingMessageStatus not a function');
       }
     } catch (err) {
       logger.debug({ chatJid, err }, 'Failed to update error reaction');
@@ -397,18 +408,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Update reaction to success status
   try {
     const updateStatusFn = (channel as any).updatePendingMessageStatus;
-    logger.info(
-      { chatJid, hasFn: typeof updateStatusFn },
-      '✅ Attempting to set success reaction',
-    );
+    logger.info({ chatJid, hasFn: typeof updateStatusFn }, '✅ Attempting to set success reaction');
     if (typeof updateStatusFn === 'function') {
       await updateStatusFn.call(channel, chatJid, 'success');
       logger.info({ chatJid }, '✅ Success reaction updated');
     } else {
-      logger.warn(
-        { chatJid, fnType: typeof updateStatusFn },
-        '⚠️ updatePendingMessageStatus not a function',
-      );
+      logger.warn({ chatJid, fnType: typeof updateStatusFn }, '⚠️ updatePendingMessageStatus not a function');
     }
   } catch (err) {
     logger.debug({ chatJid, err }, 'Failed to update success reaction');
